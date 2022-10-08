@@ -15,7 +15,10 @@
 //***** DEBUG *****//
 bool debugSerialEnabled = true;                 // Enable serial debug - default value, may be overridden
 
-//***** BLE *****//
+//***** SETTINGS *****//
+double settingRiderWeight = 78.00;
+
+//***** CALULCATION *****//
 int powerMvgAvgLen = 6; // orig = 8;
 // 8 = 2 second power average at 4 samples per sec
 // 6 = 2 second power average at 3 samples per sec
@@ -25,6 +28,17 @@ MovingAverageFilter mafPower(powerMvgAvgLen);
 int speedMvgAvgLen = 2; // orig = 2
 MovingAverageFilter mafSpeed(speedMvgAvgLen);
 
+// For power and speed declare some variables and set some default values
+long calcPrevWheelRevs;                  // For speed data set 1
+long calcPrevWheelEvntTime;                      // For speed data set 1
+long calcCurrWheelRevs;                  // For speed data set 2
+long calcCurrWheelEvntTime;                      // For speed data set 2
+
+int calcSpeedKmh;                     // Calculated speed in KM per Hr
+int calcPrevSpeedKmh;
+
+//***** BLE *****//
+bool bleScanEnabled = true;
 int bleScanTime = 5; //In seconds
 BLEScan *bleScan;
 
@@ -36,13 +50,18 @@ BLERemoteCharacteristic *bleRemoteCharHeartRate = nullptr;
 int bleHeartRateBpm = 0;
 
 BLEUUID bleServiceFitnessMachine = BLEUUID((uint16_t) 0x1826);
-BLEUUID bleCharPower = BLEUUID((uint16_t) 0x2A63);
-BLEUUID bleCharSpeed = BLEUUID((uint16_t) 0x2A5B);
+BLEUUID bleCharIndoorBikeData = BLEUUID((uint16_t) 0x2AD2);
 BLEAdvertisedDevice *bleAdvDevFitnessMachine = nullptr;
 BLEClient *bleClntFitnessMachine = nullptr;
-BLERemoteCharacteristic *bleRemoteCharPower = nullptr;
-BLERemoteCharacteristic *bleRemoteCharSpeed = nullptr;
-int blePowerWatt = 0;             // variable for the power (W) read from bluetooth
+BLERemoteCharacteristic *bleRemoteIndoorBikeData = nullptr;
+float bleSpeedKmh = 0;              // variable for the speed (kmh) read from bluetooth
+int blePowerWatt = 0;               // variable for the power (W) read from bluetooth
+
+//***** LIFT *****//
+float liftSpeedMpersec = 0;           // for calculation
+float liftResistanceWatts = 0;        // for calculation
+float liftPowerMinusResistance = 0;   // for calculation
+double liftTargetGrade = 0;
 
 //***** OLED *****//
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
@@ -63,10 +82,13 @@ void setup() {
 void loop() {
     bool bleIsAvailable = bleLoop();
 
+    liftLoop();
+
     if (!bleIsAvailable) {
         oledStartDisplay();
     }
     else {
+        liftCalcTargetGrade();
         oledValuesDisplay();
     }
 
@@ -102,19 +124,19 @@ void debugPrintln(String debugText) {
 //***** BLE Functions *****//
 class BleAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) {
-        //debugPrintln(String(F("Advertised Device: ")) + advertisedDevice.toString().c_str());
-
         // heart rate monitor found
-        if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(bleServiceHeartRate)) {
-            debugPrintln(String(F("Advertised device for heart rate monitor: ")) + advertisedDevice.toString().c_str());
+        if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(bleServiceHeartRate) && bleAdvDevHeartRate == nullptr) {
             bleAdvDevHeartRate = new BLEAdvertisedDevice(advertisedDevice);
+            debugPrintln(String(F("Advertised device for heart rate monitor: ")) + bleAdvDevHeartRate->toString().c_str());
         }
 
         // fitness machine found
-        if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(bleServiceFitnessMachine)) {
-            debugPrintln(String(F("Advertised device for fitness machine: ")) + advertisedDevice.toString().c_str());
+        if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(bleServiceFitnessMachine) && bleAdvDevFitnessMachine == nullptr) {
             bleAdvDevFitnessMachine = new BLEAdvertisedDevice(advertisedDevice);
+            debugPrintln(String(F("Advertised device for fitness machine: ")) + bleAdvDevFitnessMachine->toString().c_str());
         }
+
+        bleScanEnabled = ((bleAdvDevHeartRate == nullptr) || (bleAdvDevFitnessMachine == nullptr));
     }
 };
 
@@ -149,7 +171,7 @@ void bleSetup() {
 bool bleLoop() {
     bool isConnected = (bleConnectHeartRate() && bleConnectFitnessMachine());
 
-    if (!isConnected) {
+    if (!isConnected && bleScanEnabled) {
         // scan for devices
         debugPrintln(String(F("Starting BLE Scan for ")) + String(bleScanTime) + String(F("seconds ...")));
         BLEScanResults foundDevices = bleScan->start(bleScanTime, true);
@@ -181,16 +203,19 @@ bool bleConnectHeartRate() {
             if (pRemoteService == nullptr) {
                 debugPrintln(String(F(" * Failed to find our service UUID :  ")) + bleServiceHeartRate.toString().c_str());
                 bleClntHeartRate->disconnect();
+                return false;
             }
-            Serial.println(" * Found our service");
+            debugPrintln(" * Found our service...");
+            debugPrintln(String(F("   ** ")) + pRemoteService->toString().c_str());
 
             // Obtain a reference to the heart rate characteristic in the service of the remote BLE server.
             bleRemoteCharHeartRate = pRemoteService->getCharacteristic(bleCharHeartRate);
             if (bleRemoteCharHeartRate == nullptr) {
                 debugPrintln(String(F(" * Failed to find our characteristic UUID: ")) + bleCharHeartRate.toString().c_str());
                 bleClntHeartRate->disconnect();
+                return false;
             }
-            Serial.println(" * Found our characteristic");
+            debugPrintln(" * Found our characteristic");
 
             // Register the notification callback
             if (bleRemoteCharHeartRate->canNotify()) {
@@ -199,6 +224,7 @@ bool bleConnectHeartRate() {
             else {
                 debugPrintln(String(F(" * The heart rate characteristic cannot notify.")));
                 bleClntHeartRate->disconnect();
+                return false;
             }
         }
         else {
@@ -209,23 +235,61 @@ bool bleConnectHeartRate() {
     return (bleClntHeartRate != nullptr && bleClntHeartRate->isConnected());
 }
 
-static void blePowerNotifyCallback(BLERemoteCharacteristic *bleRemoteCharacteristic, uint8_t *data, size_t length, bool isNotify) {
-    // see specs at https://www.bluetooth.com/specifications/specs/cycling-power-service-1-1/
-    // CSCMeasurement characteristic are notified of updates approximately once per second.
+static void bleIndoorBikeDataNotifyCallback(BLERemoteCharacteristic *bleRemoteCharacteristic, uint8_t *data, size_t length, bool isNotify) {
+    //https://developer.huawei.com/consumer/en/doc/development/HMSCore-Guides/ibd-0000001051005923
 
-    // Power is returned as watts in location 2 and 3 (loc 0 and 1 is 8 bit flags)
-    byte rawpowerValue2 = data[2];       // power least sig byte in HEX
-    byte rawpowerValue3 = data[3];       // power most sig byte in HEX
+    debugPrintln(String(F("Indoor Bike Data received [")) + String(length) + String(F("]...")));
+    int index = 0;
 
-    long rawPowerTotal = (rawpowerValue2 + (rawpowerValue3 * 256));
+    // flags of indoor bike data
+    uint16_t flags = (uint16_t) ((data[index + 1] << 8) | data[index]);
+    String flagString = " * Flags =";
+    for (int i = 0; i < 16; i++) {
+        flagString += String(F(" [")) + String(i) + String(F("] ")) + String(bitRead(flags, i));
+    }
+    debugPrintln(flagString);
 
-    // Use moving average filter to give '3s power'
-    blePowerWatt = mafPower.process(rawPowerTotal);
-    debugPrintln(String(F("Notification of Power: ")) + blePowerWatt + String(F("watt")));
-}
-
-static void bleSpeedNotifyCallback(BLERemoteCharacteristic *bleRemoteCharacteristic, uint8_t *data, size_t length, bool isNotify) {
-
+    index += 2;
+    if ((flags & 0) == 0) {         // instantaneous speed
+        uint16_t value = ((uint16_t) ((data[index + 1] << 8) | data[index]));
+        bleSpeedKmh = mafSpeed.process((value * 1.0f) / 100.0f);
+        debugPrintln(String(F(" * Instantaneous Speed (kmh/avgfilter) = ")) + String(bleSpeedKmh));
+        index += 2;
+    }
+    if ((flags & 2) > 0) {          //average speed
+//        uint16_t value = ((uint16_t) ((data[index + 1] << 8) | data[index]));
+//        float averageSpeedKmh = (value * 1.0f) / 100.0f;
+//        debugPrintln(String(F(" * Average Speed (kmh) = ")) + String(averageSpeedKmh));
+        index += 2;
+    }
+    if ((flags & 4) > 0) {          //instantaneous cadence
+        uint16_t value = ((uint16_t) ((data[index + 1] << 8) | data[index]));
+        float instantaneousCadenceRevMin = (value * 1.0f) / 2.0f;
+        debugPrintln(String(F(" * Instantaneous Cadence (rev/min) = ")) + String(instantaneousCadenceRevMin));
+        index += 2;
+    }
+    if ((flags & 8) > 0) {          //average cadence
+//        uint16_t value = ((uint16_t) ((data[index + 1] << 8) | data[index]));
+//        float averageCadenceRevMin = (value * 1.0f) / 2.0f;
+//        debugPrintln(String(F(" * Average Cadence (rev/min) = ")) + String(averageCadenceRevMin));
+        index += 2;
+    }
+    if ((flags & 16) > 0) {          //total distance
+//        uint32_t distance = ((uint32_t) (data[index + 2] << 16) | (uint32_t) (data[index + 1] << 8) | data[index]);
+//        debugPrintln(String(F(" * Total distance (m) = ")) + String(distance));
+        index += 3;
+    }
+    if ((flags & 32) > 0) {         //resistance level
+//        int16_t resistance = ((int16_t) ((data[index + 1] << 8) | data[index]));
+//        debugPrintln(String(F(" * Resistance Level = ")) + String(resistance));
+        index += 2;
+    }
+    if ((flags & 64) > 0) {          //instantaneous power
+        int16_t power = ((int16_t) ((data[index + 1] << 8) | data[index]));
+        blePowerWatt = mafPower.process(power);
+        debugPrintln(String(F(" * Instantaneous Power (watt/avgfilter) = ")) + String(blePowerWatt));
+        index += 2;
+    }
 }
 
 bool bleConnectFitnessMachine() {
@@ -245,41 +309,32 @@ bool bleConnectFitnessMachine() {
             if (pRemoteService == nullptr) {
                 debugPrintln(String(F(" * Failed to find our service UUID :  ")) + bleServiceFitnessMachine.toString().c_str());
                 bleClntFitnessMachine->disconnect();
+                return false;
             }
-            Serial.println(" * Found our service");
+            debugPrintln(" * Found our service...");
+            debugPrintln(String(F("   ** ")) + pRemoteService->toString().c_str());
+
+            for (auto &myPair : *pRemoteService->getCharacteristics()) {
+                debugPrintln(String(F("     ** ")) + myPair.second->toString().c_str());
+            }
 
             // Obtain a reference to the power characteristic in the service of the remote BLE server.
-            bleRemoteCharPower = pRemoteService->getCharacteristic(bleCharPower);
-            if (bleRemoteCharPower == nullptr) {
-                debugPrintln(String(F(" * Failed to find our power characteristic UUID: ")) + bleCharPower.toString().c_str());
+            bleRemoteIndoorBikeData = pRemoteService->getCharacteristic(bleCharIndoorBikeData);
+            if (bleRemoteIndoorBikeData == nullptr) {
+                debugPrintln(String(F(" * Failed to find our power characteristic UUID: ")) + bleCharIndoorBikeData.toString().c_str());
                 bleClntFitnessMachine->disconnect();
+                return false;
             }
-            Serial.println(" * Found our characteristic for power");
+            debugPrintln(" * Found our characteristic for power");
 
             // Register the notification callback for power
-            if (bleRemoteCharPower->canNotify()) {
-                bleRemoteCharPower->registerForNotify(blePowerNotifyCallback);
+            if (bleRemoteIndoorBikeData->canNotify()) {
+                bleRemoteIndoorBikeData->registerForNotify(bleIndoorBikeDataNotifyCallback);
             }
             else {
                 debugPrintln(String(F(" * The power characteristic cannot notify.")));
                 bleClntFitnessMachine->disconnect();
-            }
-
-            // Obtain a reference to the speed characteristic in the service of the remote BLE server.
-            bleRemoteCharSpeed = pRemoteService->getCharacteristic(bleCharSpeed);
-            if (bleRemoteCharSpeed == nullptr) {
-                debugPrintln(String(F(" * Failed to find our speed characteristic UUID: ")) + bleCharSpeed.toString().c_str());
-                bleClntFitnessMachine->disconnect();
-            }
-            Serial.println(" * Found our characteristic for speed");
-
-            // Register the notification callback for power
-            if (bleRemoteCharSpeed->canNotify()) {
-                bleRemoteCharSpeed->registerForNotify(bleSpeedNotifyCallback);
-            }
-            else {
-                debugPrintln(String(F(" * The speed characteristic cannot notify.")));
-                bleClntFitnessMachine->disconnect();
+                return false;
             }
         }
         else {
@@ -288,6 +343,38 @@ bool bleConnectFitnessMachine() {
     }
 
     return (bleClntFitnessMachine != nullptr && bleClntFitnessMachine->isConnected());
+}
+//***** LIFT Functions *****//
+void liftLoop() {
+    //liftCalcTargetGrade();
+}
+
+void liftCalcTargetGrade(void) {
+    debugPrintln(String(F("Speed as base kmh = ")) + String(bleSpeedKmh));
+    float speed28 = pow(bleSpeedKmh, 2.8);                                              // pow() needed to raise y^x where x is decimal
+    debugPrintln(String(F("Speed pow 28 = ")) + String(speed28));
+    liftResistanceWatts = (0.0102 * speed28) + 9.428;                                   // calculate power from rolling / wind resistance
+    debugPrintln(String(F("Power from rolling / wind resistance = ")) + String(liftResistanceWatts));
+    liftPowerMinusResistance = blePowerWatt - liftResistanceWatts;                      // find power from climbing
+    debugPrintln(String(F("Power from climbing = ")) + String(liftPowerMinusResistance));
+
+    liftSpeedMpersec = bleSpeedKmh / 3.6;                                                  // find speed in SI units. 1 meter / second (m/s) is equal 3.6 kilometers / hour (km/h)
+    if (liftSpeedMpersec == 0) {
+        liftTargetGrade = 0;
+    }
+    else {
+        liftTargetGrade = ((liftPowerMinusResistance / (settingRiderWeight * 9.8)) / liftSpeedMpersec) * 100; // calculate grade of climb in %
+    }
+
+    //  // Limit upper and lower grades
+    //  if (inputGrade < -10) {
+    //    inputGrade = -10;
+    //  }
+    //  if (inputGrade > 20) {
+    //    inputGrade = 20;
+    //  }
+
+    debugPrintln(String(F("Calculated target grade = ")) + String(liftTargetGrade));
 }
 
 //***** OLED Functions *****//
@@ -314,26 +401,28 @@ void oledStartDisplay() {
     oledDisplay.display();
 }
 
-String oledHeartRateString() {
+String oledString03d(int value, String unit) {
     if (bleHeartRateBpm == 0) {
-        return String(F("--- bpm"));
+        return String(F("--- "));
     }
 
     if (bleHeartRateBpm >= 0 && bleHeartRateBpm < 10) {
-        return String(F("00")) + String(bleHeartRateBpm) + String(F(" bpm"));
+        return String(F("00")) + String(bleHeartRateBpm) + String(F(" ")) + unit;
     }
 
     if (bleHeartRateBpm >= 10 && bleHeartRateBpm < 99) {
-        return String(F("0")) + String(bleHeartRateBpm) + String(F(" bpm"));
+        return String(F("0")) + String(bleHeartRateBpm) + String(F(" ")) + unit;
     }
 
-    return String(bleHeartRateBpm) + String(F(" bpm"));
+    return String(bleHeartRateBpm) + String(F(" ")) + unit;
 }
 
 void oledValuesDisplay() {
     oledDisplay.clearDisplay();
     oledDisplay.setCursor(0, 0);
     oledDisplay.setTextSize(2);
-    oledDisplay.println(oledHeartRateString());
+    oledDisplay.println(String(F("Heart")) + oledString03d(bleHeartRateBpm, "bpm"));
+    oledDisplay.println(String(F("Power")) + oledString03d(blePowerWatt, "watt"));
+    oledDisplay.println(String(F("Grade")) + String(liftTargetGrade) + String(F(" %")));
     oledDisplay.display();
 }
