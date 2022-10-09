@@ -20,6 +20,7 @@
 #include <Adafruit_SSD1306.h>
 
 //***** CONFIG *****//
+const char TITLE[] = "BIKE - Climb & Blow";
 const unsigned long CONNECT_TO = 300;  // Timeout for WiFi and MQTT connection attempts in seconds
 const unsigned long RECONNECT_TO = 15; // Timeout for WiFi reconnection attempts in seconds
 const int CONFIG_SIZE = 5120;          // Configuration size
@@ -33,6 +34,14 @@ void configClear(bool all);
 int settingsWheelBase = 100;
 char settingRiderId[4] = "PAT";
 int settingRiderWeight = 78;
+String settingBleHeartRateName = "TICKR 53C9";
+String settingBleHeartRateAddr = "dd:fb:8d:93:c7:29";
+String settingBleFitnessMachineName = "KICKR CORE 33BD";
+String settingBleFitnessMachineAddr = "ed:e8:05:37:e1:f2";
+
+bool settingsAreBleDevicesSet();
+bool settingsIsBleHeartRateDevSet();
+bool settingsIsBleFitnessMachineDevSet();
 
 //***** CALULCATION *****//
 int powerMvgAvgLen = 6; // orig = 8;
@@ -97,7 +106,6 @@ void webHandleNotFound();
 void webLoop();
 
 //***** BLE *****//
-bool bleScanEnabled = true;
 int bleScanTime = 5; // In seconds
 BLEScan *bleScan;
 
@@ -118,7 +126,9 @@ int blePowerWatt = 0;  // variable for the power (W) read from bluetooth
 
 void bleSetup();
 bool bleLoop();
+bool bleIsHeartRateConnected();
 bool bleConnectHeartRate();
+bool bleIsFitnessMachineConnected();
 bool bleConnectFitnessMachine();
 
 //***** LIFT *****//
@@ -127,7 +137,6 @@ float liftResistanceWatts = 0;      // for calculation
 float liftPowerMinusResistance = 0; // for calculation
 double liftTargetGrade = 0;
 
-void liftLoop();
 void liftCalcTargetGrade();
 
 //***** OLED *****//
@@ -139,11 +148,11 @@ Adafruit_SSD1306 oledDisplay(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 void oledSetup();
 void oledStartDisplay();
 void oledWifiDisplay(String ssid);
-void oledValuesDisplay();
+void oledRefreshDisplay();
 
 void oledPrintTextCenter(String text);
 void oledPrintTextRight(String text);
-void oledPrintHeartBeatLine();
+void oledPrintHeartRateLine();
 void oledPrintPowerLine();
 void oledPrintInclineLine();
 void oledPrintInfoLine();
@@ -210,6 +219,8 @@ void setup()
     webSetup();
 
     bleSetup();
+
+    oledRefreshDisplay();
 }
 
 //*****************************************************************************************************************//
@@ -219,20 +230,12 @@ void loop()
 
     webLoop();
 
-    bool bleIsAvailable = bleLoop();
-
-    if (!bleIsAvailable)
-    {
-        liftLoop();
-    }
-
-    oledValuesDisplay();
-    delayMicroseconds(100);
+    bleLoop();
 }
 
 //*****************************************************************************************************************//
 
-//***** Config Functions *****//
+//***** CONFIG Functions *****//
 void configRead()
 {
     // Read saved config.json from SPIFFS
@@ -367,6 +370,23 @@ void configClear(bool all)
     espNodeReset();
 }
 
+//***** SETTINGS Functions *****//
+
+bool settingsAreBleDevicesSet()
+{
+    return settingsIsBleHeartRateDevSet() && settingsIsBleFitnessMachineDevSet();
+}
+
+bool settingsIsBleHeartRateDevSet()
+{
+    return (!settingBleHeartRateName.isEmpty() && !settingBleHeartRateAddr.isEmpty());
+}
+
+bool settingsIsBleFitnessMachineDevSet()
+{
+    return (!settingBleFitnessMachineName.isEmpty() && !settingBleFitnessMachineAddr.isEmpty());
+}
+
 //***** DEBUG Functions ****//
 
 void debugSetup()
@@ -401,7 +421,7 @@ void espNodeSetup()
 {
     WiFi.macAddress(espMac); // Read our MAC address and save it to espMac
 
-    String uniqueName = String(espNodeName) + "-" + String(espMac[0], HEX) + String(espMac[1], HEX) + String(espMac[2], HEX) + String(espMac[3], HEX) + String(espMac[4], HEX) + String(espMac[5], HEX);
+    String uniqueName = String(espNodeName) + "-" + String(espMac[4], HEX) + String(espMac[5], HEX);
     strcpy(espUniqueNodeName, uniqueName.c_str());
 }
 
@@ -432,10 +452,19 @@ void wifiConfig(String wifiSsid, String wifiPass)
     delay(1000);
 }
 
+void wifiAPCallback(WiFiManager *myWiFiManager)
+{
+    oledWifiDisplay(myWiFiManager->getWiFiHostname());
+}
+
 void wifiSetup()
 {
+    WiFi.setHostname(espUniqueNodeName);
+
     WiFiManager wifiManager;
-    oledWifiDisplay(espUniqueNodeName);
+    wifiManager.setTitle(TITLE);
+    wifiManager.setAPCallback(wifiAPCallback);
+
     wifiManager.autoConnect(espUniqueNodeName);
 }
 
@@ -748,20 +777,18 @@ class BleAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
     void onResult(BLEAdvertisedDevice advertisedDevice)
     {
         // heart rate monitor found
-        if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(bleServiceHeartRate) && bleAdvDevHeartRate == nullptr)
+        if (strcmp(advertisedDevice.getAddress().toString().c_str(), settingBleHeartRateAddr.c_str()) == 0 && bleAdvDevHeartRate == nullptr)
         {
             bleAdvDevHeartRate = new BLEAdvertisedDevice(advertisedDevice);
             debugPrintln(String(F("Advertised device for heart rate monitor: ")) + bleAdvDevHeartRate->toString().c_str());
         }
 
         // fitness machine found
-        if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(bleServiceFitnessMachine) && bleAdvDevFitnessMachine == nullptr)
+        if (strcmp(advertisedDevice.getAddress().toString().c_str(), settingBleFitnessMachineAddr.c_str()) == 0 && bleAdvDevFitnessMachine == nullptr)
         {
             bleAdvDevFitnessMachine = new BLEAdvertisedDevice(advertisedDevice);
             debugPrintln(String(F("Advertised device for fitness machine: ")) + bleAdvDevFitnessMachine->toString().c_str());
         }
-
-        bleScanEnabled = ((bleAdvDevHeartRate == nullptr) || (bleAdvDevFitnessMachine == nullptr));
     }
 };
 
@@ -802,12 +829,15 @@ bool bleLoop()
 {
     bool isConnected = (bleConnectHeartRate() && bleConnectFitnessMachine());
 
-    if (!isConnected && bleScanEnabled)
+    if (!isConnected)
     {
         // scan for devices
         debugPrintln(String(F("Starting BLE Scan for ")) + String(bleScanTime) + String(F("seconds ...")));
         BLEScanResults foundDevices = bleScan->start(bleScanTime, true);
-        bleScan->clearResults(); // delete results fromBLEScan buffer to release memory
+    }
+    else
+    {
+        bleScan->clearResults(); // delete results from BLEScan buffer to release memory
     }
 
     return isConnected;
@@ -817,6 +847,13 @@ static void bleHeartRateNotifyCallback(BLERemoteCharacteristic *bleRemoteCharact
 {
     bleHeartRateBpm = data[1];
     debugPrintln(String(F("Notification of Heart Rate: ")) + bleHeartRateBpm + String(F("bpm")));
+
+    oledRefreshDisplay();
+}
+
+bool bleIsHeartRateConnected()
+{
+    return (bleClntHeartRate != nullptr && bleClntHeartRate->isConnected());
 }
 
 bool bleConnectHeartRate()
@@ -940,6 +977,14 @@ static void bleIndoorBikeDataNotifyCallback(BLERemoteCharacteristic *bleRemoteCh
         debugPrintln(String(F(" * Instantaneous Power (watt/avgfilter) = ")) + String(blePowerWatt));
         index += 2;
     }
+
+    liftCalcTargetGrade();
+    oledRefreshDisplay();
+}
+
+bool bleIsFitnessMachineConnected()
+{
+    return (bleClntFitnessMachine != nullptr && bleClntFitnessMachine->isConnected());
 }
 
 bool bleConnectFitnessMachine()
@@ -1004,11 +1049,6 @@ bool bleConnectFitnessMachine()
     return (bleClntFitnessMachine != nullptr && bleClntFitnessMachine->isConnected());
 }
 //***** LIFT Functions *****//
-void liftLoop()
-{
-    liftCalcTargetGrade();
-}
-
 void liftCalcTargetGrade(void)
 {
     debugPrintln(String(F("Speed as base kmh = ")) + String(bleSpeedKmh));
@@ -1047,6 +1087,7 @@ void oledSetup()
     if (oledDisplay.begin(SSD1306_SWITCHCAPVCC, 0x3C))
     {
         oledStartDisplay();
+        delayMicroseconds(500);
     }
     else
     {
@@ -1064,7 +1105,7 @@ void oledStartDisplay()
     oledDisplay.setTextSize(1);
     oledPrintTextCenter(String(F("CLIMB & BLOW")));
     oledDisplay.println();
-    oledPrintTextCenter(String(F("Starting up... ")));
+    oledPrintTextCenter(String(F("Starting up...")));
     oledDisplay.display();
 }
 
@@ -1084,20 +1125,70 @@ void oledWifiDisplay(String ssid)
     oledDisplay.display();
 }
 
+void oledNoBleDevicesDisplay()
+{
+    oledDisplay.clearDisplay();
+    oledDisplay.setTextSize(2);
+    oledDisplay.setTextColor(WHITE);
+    oledDisplay.setCursor(0, 0);
+    oledPrintTextCenter(String(F("BIKE")));
+    oledDisplay.setTextSize(1);
+    oledPrintTextCenter(String(F("CLIMB & BLOW")));
+    oledDisplay.println();
+    oledPrintTextCenter(String(F("No devices set...")));
+    oledPrintTextCenter(String(F("Use web interface for config.")));
+    oledDisplay.display();
+}
+
+void oledConnectingBleDevicesDisplay()
+{
+    oledDisplay.clearDisplay();
+    oledDisplay.setTextSize(2);
+    oledDisplay.setTextColor(WHITE);
+    oledDisplay.setCursor(0, 0);
+    oledPrintTextCenter(String(F("BIKE")));
+    oledDisplay.setTextSize(1);
+    oledPrintTextCenter(String(F("CLIMB & BLOW")));
+    oledDisplay.println();
+    oledPrintTextCenter(String(F("Connecting devices...")));
+    oledDisplay.println();
+    oledDisplay.println((bleIsHeartRateConnected() ? String(F(" OK - ")) : String(F(" ?? - "))) + settingBleHeartRateName);
+    oledDisplay.println((bleIsFitnessMachineConnected() ? String(F(" OK - ")) : String(F(" ?? - "))) + settingBleFitnessMachineName);
+    oledDisplay.display();
+}
+
 void oledValuesDisplay()
 {
     oledDisplay.clearDisplay();
     oledDisplay.setCursor(0, 0);
 
     oledDisplay.setTextSize(2);
-    oledPrintHeartBeatLine();
+    oledPrintHeartRateLine();
     oledPrintPowerLine();
     oledPrintInclineLine();
 
     oledDisplay.setTextSize(1);
+    oledDisplay.println();
     oledPrintInfoLine();
 
     oledDisplay.display();
+}
+
+void oledRefreshDisplay()
+{
+    if (!settingsAreBleDevicesSet())
+    {
+        oledNoBleDevicesDisplay();
+        return;
+    }
+
+    if (!bleIsHeartRateConnected() || !bleIsFitnessMachineConnected())
+    {
+        oledConnectingBleDevicesDisplay();
+        return;
+    }
+
+    oledValuesDisplay();
 }
 
 void oledPrintTextCenter(String text)
@@ -1124,25 +1215,25 @@ void oledPrintTextRight(String text)
     oledDisplay.println(text);
 }
 
-void oledPrintHeartBeatLine()
+void oledPrintHeartRateLine()
 {
     char heartChar = (char)0x03;
-    String heartBeat = String(heartChar) + " ";
+    String heartRate = String(heartChar) + " ";
 
     if (bleHeartRateBpm == 0)
     {
-        heartBeat += String(F("---"));
+        heartRate += String(F("---"));
     }
     else if (bleHeartRateBpm > 0 && bleHeartRateBpm < 10)
     {
-        heartBeat += String(F("00")) + String(bleHeartRateBpm);
+        heartRate += String(F("00")) + String(bleHeartRateBpm);
     }
     else if (bleHeartRateBpm >= 10 && bleHeartRateBpm < 99)
     {
-        heartBeat += String(bleHeartRateBpm);
+        heartRate += String(bleHeartRateBpm);
     }
 
-    oledDisplay.println(heartBeat);
+    oledDisplay.println(heartRate);
 }
 
 void oledPrintPowerLine()
@@ -1179,6 +1270,5 @@ void oledPrintInclineLine()
 
 void oledPrintInfoLine()
 {
-    oledPrintTextRight(String(settingRiderId));
-    oledPrintTextRight(String(espUniqueNodeName));
+    oledPrintTextRight(String(settingRiderId) + String(F("@")) + String(espUniqueNodeName));
 }
