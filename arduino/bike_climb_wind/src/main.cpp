@@ -62,14 +62,14 @@ int calcSpeedKmh;           // Calculated speed in KM per Hr
 int calcPrevSpeedKmh;
 
 //***** DEBUG *****//
-bool debugSerialEnabled = true; // Enable serial debug - default value, may be overridden
+bool debugSerialEnabled = false; // Enable serial debug - default value, may be overridden
 
 void debugSetup();
 void debugPrintln(String debugText);
 
 //***** ESP *****//
 char espFwName[16] = "BikeClimbWind"; // Name of the firmware
-char espFwVersion[8] = "0.1";         // Version of the firmware
+char espFwVersion[8] = "0.2";         // Version of the firmware
 byte espMac[6];                       // Byte array to store our MAC address
 
 char espNodeName[32] = "BCW";     // Nodes name - default value, may be overridden
@@ -1102,7 +1102,12 @@ void oledStartDisplay()
     oledDisplay.setTextColor(WHITE);
     oledDisplay.setCursor(0, 0);
     oledPrintTextCenter(String(F("BIKE")));
+    int yPos = oledDisplay.getCursorY();
     oledDisplay.setTextSize(1);
+    oledDisplay.setCursor(0, 0);
+    oledPrintTextRight(String(F("v")) + String(espFwVersion));
+    oledDisplay.setCursor(0, yPos);
+
     oledPrintTextCenter(String(F("CLIMB & BLOW")));
     oledDisplay.println();
     oledPrintTextCenter(String(F("Starting up...")));
@@ -1116,7 +1121,12 @@ void oledWifiDisplay(String ssid)
     oledDisplay.setTextColor(WHITE);
     oledDisplay.setCursor(0, 0);
     oledPrintTextCenter(String(F("BIKE")));
+    int yPos = oledDisplay.getCursorY();
     oledDisplay.setTextSize(1);
+    oledDisplay.setCursor(0, 0);
+    oledPrintTextRight(String(F("v")) + String(espFwVersion));
+    oledDisplay.setCursor(0, yPos);
+
     oledPrintTextCenter(String(F("CLIMB & BLOW")));
     oledDisplay.println();
     oledPrintTextCenter(String(F("Connect to WiFi...")));
@@ -1132,7 +1142,12 @@ void oledNoBleDevicesDisplay()
     oledDisplay.setTextColor(WHITE);
     oledDisplay.setCursor(0, 0);
     oledPrintTextCenter(String(F("BIKE")));
+    int yPos = oledDisplay.getCursorY();
     oledDisplay.setTextSize(1);
+    oledDisplay.setCursor(0, 0);
+    oledPrintTextRight(String(F("v")) + String(espFwVersion));
+    oledDisplay.setCursor(0, yPos);
+
     oledPrintTextCenter(String(F("CLIMB & BLOW")));
     oledDisplay.println();
     oledPrintTextCenter(String(F("No devices set...")));
@@ -1147,7 +1162,13 @@ void oledConnectingBleDevicesDisplay()
     oledDisplay.setTextColor(WHITE);
     oledDisplay.setCursor(0, 0);
     oledPrintTextCenter(String(F("BIKE")));
+
+    int yPos = oledDisplay.getCursorY();
     oledDisplay.setTextSize(1);
+    oledDisplay.setCursor(0, 0);
+    oledPrintTextRight(String(F("v")) + String(espFwVersion));
+    oledDisplay.setCursor(0, yPos);
+
     oledPrintTextCenter(String(F("CLIMB & BLOW")));
     oledDisplay.println();
     oledPrintTextCenter(String(F("Connecting devices...")));
@@ -1164,6 +1185,15 @@ void oledValuesDisplay()
 
     oledDisplay.setTextSize(2);
     oledPrintHeartRateLine();
+    oledPrintTextCenter(String(F("BIKE")));
+
+    int yPos = oledDisplay.getCursorY();
+    oledDisplay.setTextSize(1);
+    oledDisplay.setCursor(0, 0);
+    oledPrintTextRight(String(F("v")) + String(espFwVersion));
+    oledDisplay.setCursor(0, yPos);
+
+    oledDisplay.setTextSize(2);
     oledPrintPowerLine();
     oledPrintInclineLine();
 
@@ -1228,7 +1258,7 @@ void oledPrintHeartRateLine()
     {
         heartRate += String(F("00")) + String(bleHeartRateBpm);
     }
-    else if (bleHeartRateBpm >= 10 && bleHeartRateBpm < 99)
+    else if (bleHeartRateBpm >= 10)
     {
         heartRate += String(bleHeartRateBpm);
     }
@@ -1248,7 +1278,7 @@ void oledPrintPowerLine()
     {
         power += String(F("00")) + String(blePowerWatt);
     }
-    else if (blePowerWatt >= 10 && blePowerWatt < 99)
+    else if (blePowerWatt >= 10)
     {
         power += String(blePowerWatt);
     }
