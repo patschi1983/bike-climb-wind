@@ -18,6 +18,8 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <VL6180X.h>
+#include <Adafruit_SHT31.h>
 
 //***** CONFIG *****//
 const char TITLE[] = "BIKE - Climb & Blow";
@@ -137,7 +139,21 @@ float liftResistanceWatts = 0;      // for calculation
 float liftPowerMinusResistance = 0; // for calculation
 double liftTargetGrade = 0;
 
+VL6180X liftDistanceSensor;
+
+void liftSetup();
+void liftControl();
 void liftCalcTargetGrade();
+
+//***** BLOW *****//
+Adafruit_SHT31 blowAirHumSensor = Adafruit_SHT31();
+float blowTAir = 19.5; // Actual AIR Temp. measured
+float blowRH = 0.40;   // Relative Humidity (##%) measured
+float blowAirTempDegC = 0.0;
+float blowHumidityPerc = 0.0;
+
+void blowSetup();
+void blowControl();
 
 //***** OLED *****//
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
@@ -152,8 +168,8 @@ void oledRefreshDisplay();
 
 void oledPrintTextCenter(String text);
 void oledPrintTextRight(String text);
-void oledPrintHeartRateLine();
-void oledPrintPowerLine();
+void oledPrintHeartRateAndPowerLine();
+void oledPrintDegreeAndHumidityLine();
 void oledPrintInclineLine();
 void oledPrintInfoLine();
 
@@ -219,6 +235,10 @@ void setup()
     webSetup();
 
     bleSetup();
+
+    liftSetup();
+
+    blowSetup();
 
     oledRefreshDisplay();
 }
@@ -440,6 +460,7 @@ void wifiResetSettings()
     debugPrintln(F("WIFI: Clearing WiFi settings..."));
 
     WiFiManager wifiManager;
+    wifiManager.setDebugOutput(debugSerialEnabled);
     wifiManager.resetSettings();
 }
 
@@ -827,26 +848,30 @@ void bleSetup()
 
 bool bleLoop()
 {
-    bool isConnected = (bleConnectHeartRate() && bleConnectFitnessMachine());
+    bleConnectHeartRate();
+    bleConnectFitnessMachine();
 
-    if (!isConnected)
+    if (!bleIsHeartRateConnected() || !bleIsFitnessMachineConnected())
     {
         // scan for devices
         debugPrintln(String(F("Starting BLE Scan for ")) + String(bleScanTime) + String(F("seconds ...")));
         BLEScanResults foundDevices = bleScan->start(bleScanTime, true);
+
+        return false;
     }
     else
     {
         bleScan->clearResults(); // delete results from BLEScan buffer to release memory
+        return true;
     }
-
-    return isConnected;
 }
 
 static void bleHeartRateNotifyCallback(BLERemoteCharacteristic *bleRemoteCharacteristic, uint8_t *data, size_t length, bool isNotify)
 {
     bleHeartRateBpm = data[1];
     debugPrintln(String(F("Notification of Heart Rate: ")) + bleHeartRateBpm + String(F("bpm")));
+
+    blowControl();
 
     oledRefreshDisplay();
 }
@@ -978,7 +1003,8 @@ static void bleIndoorBikeDataNotifyCallback(BLERemoteCharacteristic *bleRemoteCh
         index += 2;
     }
 
-    liftCalcTargetGrade();
+    liftControl();
+
     oledRefreshDisplay();
 }
 
@@ -1049,7 +1075,38 @@ bool bleConnectFitnessMachine()
     return (bleClntFitnessMachine != nullptr && bleClntFitnessMachine->isConnected());
 }
 //***** LIFT Functions *****//
-void liftCalcTargetGrade(void)
+void liftSetup()
+{
+    // initialize distance sensor
+    debugPrintln("Initialized distance sensor.");
+
+    liftDistanceSensor.init();
+    liftDistanceSensor.configureDefault();
+    liftDistanceSensor.setScaling(3); // Only scaling factors  #3 will work in 30+ cm range
+
+    // Reduce range max convergence time and the inter-measurement
+    // -time to 30 ms and 50 ms, respectively, to allow 10 Hz
+    // operation. Somewhat more power consumption but higher accuracy!
+    liftDistanceSensor.writeReg(VL6180X::SYSRANGE__MAX_CONVERGENCE_TIME, 30);
+    liftDistanceSensor.writeReg(VL6180X::SYSRANGE__INTERMEASUREMENT_PERIOD, 50);
+    // stop continuous mode if already active
+    liftDistanceSensor.stopContinuous();
+    // in case stopContinuous() triggered a single-shot
+    // measurement, wait for it to complete
+    delay(300);
+    // start range continuous mode with a period of 100 ms
+    liftDistanceSensor.startRangeContinuous(100);
+}
+
+void liftControl()
+{
+    liftCalcTargetGrade();
+
+    uint16_t range = liftDistanceSensor.readRangeContinuousMillimeters();
+    debugPrintln(String(F("Range (mm): ")) + String(range));
+}
+
+void liftCalcTargetGrade()
 {
     debugPrintln(String(F("Speed as base kmh = ")) + String(bleSpeedKmh));
     float speed28 = pow(bleSpeedKmh, 2.8); // pow() needed to raise y^x where x is decimal
@@ -1078,6 +1135,26 @@ void liftCalcTargetGrade(void)
     //  }
 
     debugPrintln(String(F("Calculated target grade = ")) + String(liftTargetGrade));
+}
+
+//***** BLOW Functions *****//
+
+void blowSetup()
+{
+    debugPrintln("Initialized air humidity sensor.");
+    blowAirHumSensor.begin();
+}
+
+void blowControl()
+{
+    float temp = blowAirHumSensor.readTemperature();
+    float hum = blowAirHumSensor.readHumidity();
+
+    blowAirTempDegC = (!isnan(temp)) ? temp : 0.0;
+    blowHumidityPerc = (!isnan(hum)) ? hum : 0.0;
+
+    debugPrintln(String(F("Temperature: ")) + String(blowAirTempDegC));
+    debugPrintln(String(F("Humidity: ")) + String(blowHumidityPerc));
 }
 
 //***** OLED Functions *****//
@@ -1183,19 +1260,13 @@ void oledValuesDisplay()
     oledDisplay.clearDisplay();
     oledDisplay.setCursor(0, 0);
 
-    oledDisplay.setTextSize(2);
-    oledPrintHeartRateLine();
-    oledPrintTextCenter(String(F("BIKE")));
-
-    int yPos = oledDisplay.getCursorY();
-    oledDisplay.setTextSize(1);
-    oledDisplay.setCursor(0, 0);
-    oledPrintTextRight(String(F("v")) + String(espFwVersion));
-    oledDisplay.setCursor(0, yPos);
-
-    oledDisplay.setTextSize(2);
-    oledPrintPowerLine();
+    oledDisplay.setTextSize(3);
     oledPrintInclineLine();
+
+    oledDisplay.setTextSize(1);
+    oledDisplay.println();
+    oledPrintHeartRateAndPowerLine();
+    oledPrintDegreeAndHumidityLine();
 
     oledDisplay.setTextSize(1);
     oledDisplay.println();
@@ -1245,7 +1316,7 @@ void oledPrintTextRight(String text)
     oledDisplay.println(text);
 }
 
-void oledPrintHeartRateLine()
+void oledPrintHeartRateAndPowerLine()
 {
     char heartChar = (char)0x03;
     String heartRate = String(heartChar) + " ";
@@ -1254,51 +1325,80 @@ void oledPrintHeartRateLine()
     {
         heartRate += String(F("---"));
     }
-    else if (bleHeartRateBpm > 0 && bleHeartRateBpm < 10)
-    {
-        heartRate += String(F("00")) + String(bleHeartRateBpm);
-    }
-    else if (bleHeartRateBpm >= 10)
+    else
     {
         heartRate += String(bleHeartRateBpm);
     }
 
-    oledDisplay.println(heartRate);
-}
+    if (bleHeartRateBpm <= 99)
+    {
+        heartRate += String(F(" "));
+    }
 
-void oledPrintPowerLine()
-{
     String power = "W ";
 
     if (blePowerWatt == 0)
     {
         power += String(F("---"));
     }
-    else if (blePowerWatt > 0 && blePowerWatt < 10)
-    {
-        power += String(F("00")) + String(blePowerWatt);
-    }
-    else if (blePowerWatt >= 10)
+    else
     {
         power += String(blePowerWatt);
     }
 
-    oledDisplay.println(power);
+    String line = heartRate + String(F(" ")) + power;
+    oledDisplay.println(line);
+}
+
+void oledPrintDegreeAndHumidityLine()
+{
+    String degree = String(F("C "));
+    int degreeVal = blowAirTempDegC;
+
+    if (degreeVal == 0)
+    {
+        degree += String(F("--"));
+    }
+    else if (degreeVal > 0 && degreeVal < 10)
+    {
+        degree += String(F(" ")) + String(degreeVal);
+    }
+    else if (degreeVal >= 10)
+    {
+        degree += String(degreeVal);
+    }
+
+    String humidity = String(F("H "));
+    int humidityVal = blowHumidityPerc;
+
+    if (humidityVal == 0)
+    {
+        humidity += String(F("--"));
+    }
+    else if (humidityVal > 0 && humidityVal < 10)
+    {
+        humidity += String(F("0")) + String(humidityVal);
+    }
+    else if (humidityVal >= 10)
+    {
+        humidity += String(humidityVal);
+    }
+
+    String line = degree + String(F("  ")) + humidity;
+    oledDisplay.println(line);
 }
 
 void oledPrintInclineLine()
 {
-    String incline = "% ";
-
     char inclineStr[5] = "";
     sprintf(&inclineStr[0], "%.1f", liftTargetGrade);
 
-    incline += String(inclineStr);
+    String incline = String(inclineStr) + String(F("%"));
 
     oledDisplay.println(incline);
 }
 
 void oledPrintInfoLine()
 {
-    oledPrintTextRight(String(settingRiderId) + String(F("@")) + String(espUniqueNodeName));
+    oledPrintTextRight(String(settingRiderId) + String(F("@")) + String(espUniqueNodeName) + String(F("@")) + String(espFwVersion));
 }
