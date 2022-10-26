@@ -20,6 +20,7 @@
 #include <Adafruit_SSD1306.h>
 #include <VL6180X.h>
 #include <Adafruit_SHT31.h>
+#include <math.h>
 
 //***** CONFIG *****//
 const char TITLE[] = "BIKE - Climb & Blow";
@@ -33,7 +34,7 @@ void configSave();
 void configClear(bool all);
 
 //***** SETTINGS *****//
-int settingsWheelBase = 100;
+int settingsWheelBaseMM = 1000;
 char settingRiderId[4] = "PAT";
 int settingRiderWeight = 78;
 String settingBleHeartRateName = "TICKR 53C9";
@@ -64,6 +65,7 @@ int calcSpeedKmh;           // Calculated speed in KM per Hr
 int calcPrevSpeedKmh;
 
 //***** DEBUG *****//
+
 bool debugSerialEnabled = false; // Enable serial debug - default value, may be overridden
 
 void debugSetup();
@@ -71,7 +73,7 @@ void debugPrintln(String debugText);
 
 //***** ESP *****//
 char espFwName[16] = "BikeClimbWind"; // Name of the firmware
-char espFwVersion[8] = "0.2";         // Version of the firmware
+char espFwVersion[8] = "0.3";         // Version of the firmware
 byte espMac[6];                       // Byte array to store our MAC address
 
 char espNodeName[32] = "BCW";     // Nodes name - default value, may be overridden
@@ -137,13 +139,39 @@ bool bleConnectFitnessMachine();
 float liftSpeedMpersec = 0;         // for calculation
 float liftResistanceWatts = 0;      // for calculation
 float liftPowerMinusResistance = 0; // for calculation
-double liftTargetGrade = 0;
+
+double liftTargetGradePrecise = 0.0;
+int liftTargetGrade = 0;
 
 VL6180X liftDistanceSensor;
+int liftDistanceMvgAvgLen = 3;
+MovingAverageFilter mafLiftDistance(liftDistanceMvgAvgLen);
+uint16_t liftDistance = 0;
+
+#define LIFT_PIN_mL 26
+#define LIFT_PIN_mR 27
+uint16_t liftMaxDistance = 350;
+uint16_t liftMinDistance = 60;
+uint16_t liftLevelPos = 250;
+uint16_t liftTargetDistance = 0;     // the target distance
+uint16_t liftLastTargetDistance = 0; // the last target distance
+
+bool liftManualMode = false;
+bool liftLeveledInitially = false;
 
 void liftSetup();
 void liftControl();
+bool liftIsMoving();
+int liftGetMovingState();
+void liftReadDistance();
+void liftFillDistanceMovingAverage();
 void liftCalcTargetGrade();
+void liftUp();
+void liftDown();
+void liftStop();
+void liftLevel();
+void liftSetManualMode(bool manualMode);
+bool liftIsManualModeSet();
 
 //***** BLOW *****//
 Adafruit_SHT31 blowAirHumSensor = Adafruit_SHT31();
@@ -175,15 +203,6 @@ void oledPrintInfoLine();
 
 //***** HTML Text - Root *****//
 const char HTML_ROOT_SETTINGS[] PROGMEM = "<a href='/settings'><button>Settings</button></a>";
-#ifdef BUTTON_MODE
-const char HTML_ROOT_BUTTONS[] PROGMEM = "<hr><a href='/buttons'><button>Buttons</button></a>";
-#endif
-#ifdef RFID_MODE
-const char HTML_ROOT_RFID[] PROGMEM = "<hr><a href='/rfid'><button>RFID</button></a>";
-#endif
-#ifdef MULTI_SENSOR_MODE
-const char HTML_ROOT_MULTI[] PROGMEM = "<hr><a href='/multi'><button>Multi Sensor</button></a>";
-#endif
 const char HTML_ROOT_STATUS[] PROGMEM = "<hr><a href='/status'><button>Status</button></a>";
 
 //***** HTML Text - Setting *****//
@@ -246,6 +265,8 @@ void setup()
 //*****************************************************************************************************************//
 void loop()
 {
+    liftLevel(); // initially level lift
+
     wifiLoop();
 
     webLoop();
@@ -855,7 +876,8 @@ bool bleLoop()
     {
         // scan for devices
         debugPrintln(String(F("Starting BLE Scan for ")) + String(bleScanTime) + String(F("seconds ...")));
-        BLEScanResults foundDevices = bleScan->start(bleScanTime, true);
+
+        bleScan->start(bleScanTime, true);
 
         return false;
     }
@@ -869,7 +891,7 @@ bool bleLoop()
 static void bleHeartRateNotifyCallback(BLERemoteCharacteristic *bleRemoteCharacteristic, uint8_t *data, size_t length, bool isNotify)
 {
     bleHeartRateBpm = data[1];
-    debugPrintln(String(F("Notification of Heart Rate: ")) + bleHeartRateBpm + String(F("bpm")));
+    // debugPrintln(String(F("Notification of Heart Rate: ")) + bleHeartRateBpm + String(F("bpm")));
 
     blowControl();
 
@@ -942,7 +964,7 @@ static void bleIndoorBikeDataNotifyCallback(BLERemoteCharacteristic *bleRemoteCh
 {
     // https://developer.huawei.com/consumer/en/doc/development/HMSCore-Guides/ibd-0000001051005923
 
-    debugPrintln(String(F("Indoor Bike Data received [")) + String(length) + String(F("]...")));
+    // debugPrintln(String(F("Indoor Bike Data received [")) + String(length) + String(F("]...")));
     int index = 0;
 
     // flags of indoor bike data
@@ -952,14 +974,14 @@ static void bleIndoorBikeDataNotifyCallback(BLERemoteCharacteristic *bleRemoteCh
     {
         flagString += String(F(" [")) + String(i) + String(F("] ")) + String(bitRead(flags, i));
     }
-    debugPrintln(flagString);
+    // debugPrintln(flagString);
 
     index += 2;
     if ((flags & 0) == 0)
     { // instantaneous speed
         uint16_t value = ((uint16_t)((data[index + 1] << 8) | data[index]));
         bleSpeedKmh = mafSpeed.process((value * 1.0f) / 100.0f);
-        debugPrintln(String(F(" * Instantaneous Speed (kmh/avgfilter) = ")) + String(bleSpeedKmh));
+        // debugPrintln(String(F(" * Instantaneous Speed (kmh/avgfilter) = ")) + String(bleSpeedKmh));
         index += 2;
     }
     if ((flags & 2) > 0)
@@ -973,7 +995,7 @@ static void bleIndoorBikeDataNotifyCallback(BLERemoteCharacteristic *bleRemoteCh
     { // instantaneous cadence
         uint16_t value = ((uint16_t)((data[index + 1] << 8) | data[index]));
         float instantaneousCadenceRevMin = (value * 1.0f) / 2.0f;
-        debugPrintln(String(F(" * Instantaneous Cadence (rev/min) = ")) + String(instantaneousCadenceRevMin));
+        // debugPrintln(String(F(" * Instantaneous Cadence (rev/min) = ")) + String(instantaneousCadenceRevMin));
         index += 2;
     }
     if ((flags & 8) > 0)
@@ -999,11 +1021,14 @@ static void bleIndoorBikeDataNotifyCallback(BLERemoteCharacteristic *bleRemoteCh
     { // instantaneous power
         int16_t power = ((int16_t)((data[index + 1] << 8) | data[index]));
         blePowerWatt = mafPower.process(power);
-        debugPrintln(String(F(" * Instantaneous Power (watt/avgfilter) = ")) + String(blePowerWatt));
+        // debugPrintln(String(F(" * Instantaneous Power (watt/avgfilter) = ")) + String(blePowerWatt));
         index += 2;
     }
 
-    liftControl();
+    if (bleIsHeartRateConnected() && bleIsFitnessMachineConnected())
+    {
+        liftControl();
+    }
 
     oledRefreshDisplay();
 }
@@ -1096,45 +1121,211 @@ void liftSetup()
     delay(300);
     // start range continuous mode with a period of 100 ms
     liftDistanceSensor.startRangeContinuous(100);
+
+    // fill moving average filter for distance
+    liftFillDistanceMovingAverage();
+
+    // initialize motor movement pins
+    pinMode(LIFT_PIN_mL, OUTPUT);
+    pinMode(LIFT_PIN_mR, OUTPUT);
+
+    // stop lift
+    liftStop();
 }
 
 void liftControl()
 {
     liftCalcTargetGrade();
+    liftReadDistance();
 
+    debugPrintln(String(F("Starting lift control...")));
+
+    // convert percent to float
+    float inclineFactor = (liftTargetGrade * 0.01);
+
+    // get target distance for lift
+    int tempTargetDistance = (inclineFactor * settingsWheelBaseMM);
+
+    debugPrintln(String(F("Temporary target distance - ")) + String(tempTargetDistance));
+    liftTargetDistance = liftLevelPos - tempTargetDistance;
+
+    // limit min distance
+    if (liftTargetDistance < liftMinDistance)
+    {
+        liftTargetDistance = liftMinDistance;
+        debugPrintln(String(F("Min distance reached - limited to")) + String(liftMinDistance));
+    }
+
+    // limit max distance
+    if (liftTargetDistance > liftMaxDistance)
+    {
+        liftTargetDistance = liftMaxDistance;
+        debugPrintln(String(F("Max distance reached - limited to")) + String(liftMaxDistance));
+    }
+
+    // check if lift action is needed
+    if (liftTargetDistance == liftLastTargetDistance)
+    {
+        debugPrintln(String(F("No movement - no change in distance since last lift action")));
+        return;
+    }
+
+    // values have changed since last lift action
+    debugPrintln(String(F("Lift target distance - ")) + String(liftTargetDistance));
+    debugPrintln(String(F("Lift actucal distance - ")) + String(liftDistance));
+
+    // only start moving if target distance and lift distance has a difference of more then the configured threshold
+    int distanceGap = (liftDistance - liftTargetDistance);
+
+    if ((distanceGap < 6 && distanceGap > -6) && !liftIsMoving()) // only start moving is gap is bigger then 5mm
+    {
+        debugPrintln(String(F("No movement - gap is to small - ")) + String(distanceGap));
+        return;
+    }
+
+    // control movement
+    if (liftDistance > liftTargetDistance)
+    {
+        liftUp();
+        debugPrintln(String(F("Lift is moving up - T#")) + String(liftTargetDistance) + String(F("|C#")) + String(liftDistance));
+    }
+
+    if (liftDistance < liftTargetDistance)
+    {
+        liftDown();
+        debugPrintln(String(F("Lift is moving down - T#")) + String(liftTargetDistance) + String(F("|C#")) + String(liftDistance));
+    }
+
+    if (distanceGap < 2 && distanceGap > -2)
+    {
+        liftStop();
+        liftLastTargetDistance = liftTargetDistance; // save last target distance
+
+        debugPrintln(String(F("Lift stopped - T#")) + String(liftTargetDistance) + String(F("|C#")) + String(liftDistance));
+    }
+}
+
+bool liftIsMoving()
+{
+    return (liftGetMovingState() != 0);
+}
+
+int liftGetMovingState()
+{
+    // 0 for stop 1 for up and -1 for down
+
+    if ((digitalRead(LIFT_PIN_mL) == HIGH) && (digitalRead(LIFT_PIN_mR) == LOW))
+    {
+        return 1;
+    }
+
+    if ((digitalRead(LIFT_PIN_mL) == LOW) && (digitalRead(LIFT_PIN_mR) == HIGH))
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+void liftReadDistance()
+{
     uint16_t range = liftDistanceSensor.readRangeContinuousMillimeters();
-    debugPrintln(String(F("Range (mm): ")) + String(range));
+    liftDistance = mafLiftDistance.process(range);
+
+    debugPrintln(String(F("Distance (mm): ")) + String(liftDistance));
+}
+
+void liftFillDistanceMovingAverage()
+{
+    debugPrintln(String(F("Start filling distance moving average:")));
+
+    for (int i = 0; i < liftDistanceMvgAvgLen * 3; i++)
+    {
+        liftReadDistance();
+    }
+
+    debugPrintln(String(F("Distance moving average is filled.")));
 }
 
 void liftCalcTargetGrade()
 {
-    debugPrintln(String(F("Speed as base kmh = ")) + String(bleSpeedKmh));
+    // debugPrintln(String(F("Speed as base kmh = ")) + String(bleSpeedKmh));
     float speed28 = pow(bleSpeedKmh, 2.8); // pow() needed to raise y^x where x is decimal
-    debugPrintln(String(F("Speed pow 28 = ")) + String(speed28));
+    // debugPrintln(String(F("Speed pow 28 = ")) + String(speed28));
     liftResistanceWatts = (0.0102 * speed28) + 9.428; // calculate power from rolling / wind resistance
-    debugPrintln(String(F("Power from rolling / wind resistance = ")) + String(liftResistanceWatts));
+    // debugPrintln(String(F("Power from rolling / wind resistance = ")) + String(liftResistanceWatts));
     liftPowerMinusResistance = blePowerWatt - liftResistanceWatts; // find power from climbing
-    debugPrintln(String(F("Power from climbing = ")) + String(liftPowerMinusResistance));
+    // debugPrintln(String(F("Power from climbing = ")) + String(liftPowerMinusResistance));
 
     liftSpeedMpersec = bleSpeedKmh / 3.6; // find speed in SI units. 1 meter / second (m/s) is equal 3.6 kilometers / hour (km/h)
     if (liftSpeedMpersec == 0)
     {
-        liftTargetGrade = 0;
+        liftTargetGradePrecise = 0;
     }
     else
     {
-        liftTargetGrade = ((liftPowerMinusResistance / (settingRiderWeight * 9.8)) / liftSpeedMpersec) * 100; // calculate grade of climb in %
+        liftTargetGradePrecise = ((liftPowerMinusResistance / (settingRiderWeight * 9.8)) / liftSpeedMpersec) * 100; // calculate grade of climb in %
     }
 
-    //  // Limit upper and lower grades
-    //  if (inputGrade < -10) {
-    //    inputGrade = -10;
-    //  }
-    //  if (inputGrade > 20) {
-    //    inputGrade = 20;
-    //  }
+    // round an cast to int
+    if (liftTargetGradePrecise > 0.5)
+    {
+        liftTargetGrade = round(liftTargetGradePrecise + 0.5);
+    }
+    else
+    {
+        liftTargetGrade = round(liftTargetGradePrecise);
+    }
 
-    debugPrintln(String(F("Calculated target grade = ")) + String(liftTargetGrade));
+    debugPrintln(String(F("Calculated target grade = P")) + String(liftTargetGradePrecise) + String(F("/R")) + String(liftTargetGrade));
+}
+
+void liftUp()
+{
+    digitalWrite(LIFT_PIN_mL, HIGH);
+    digitalWrite(LIFT_PIN_mR, LOW);
+}
+
+void liftDown()
+{
+    digitalWrite(LIFT_PIN_mL, LOW);
+    digitalWrite(LIFT_PIN_mR, HIGH);
+}
+
+void liftStop()
+{
+    digitalWrite(LIFT_PIN_mL, LOW);
+    digitalWrite(LIFT_PIN_mR, LOW);
+}
+
+void liftLevel()
+{
+    if (!liftLeveledInitially)
+    {
+        // level lift
+        debugPrintln(String(F("Start leveling lift...")));
+        liftControl();
+        sleep(1);
+
+        while (liftIsMoving())
+        {
+            liftControl();
+        }
+
+        debugPrintln(String(F("Leveling of lift done.")));
+
+        liftLeveledInitially = true;
+    }
+}
+
+void liftSetManualMode(bool manualMode)
+{
+    liftManualMode = manualMode;
+}
+
+bool liftIsManualModeSet()
+{
+    return liftManualMode;
 }
 
 //***** BLOW Functions *****//
@@ -1153,8 +1344,8 @@ void blowControl()
     blowAirTempDegC = (!isnan(temp)) ? temp : 0.0;
     blowHumidityPerc = (!isnan(hum)) ? hum : 0.0;
 
-    debugPrintln(String(F("Temperature: ")) + String(blowAirTempDegC));
-    debugPrintln(String(F("Humidity: ")) + String(blowHumidityPerc));
+    // debugPrintln(String(F("Temperature: ")) + String(blowAirTempDegC));
+    // debugPrintln(String(F("Humidity: ")) + String(blowHumidityPerc));
 }
 
 //***** OLED Functions *****//
@@ -1390,12 +1581,25 @@ void oledPrintDegreeAndHumidityLine()
 
 void oledPrintInclineLine()
 {
-    char inclineStr[5] = "";
-    sprintf(&inclineStr[0], "%.1f", liftTargetGrade);
+    // char inclineStr[5] = "";
+    // sprintf(&inclineStr[0], "%.1f", liftTargetGrade);
 
-    String incline = String(inclineStr) + String(F("%"));
+    String incline = String(liftTargetGrade) + String(F("%"));
 
-    oledDisplay.println(incline);
+    oledDisplay.print(incline);
+
+    switch (liftGetMovingState())
+    {
+    case 1:
+        oledPrintTextRight(String((char)0x18));
+        break;
+    case 0:
+        oledPrintTextRight(String(F("-")));
+        break;
+    case -1:
+        oledPrintTextRight(String((char)0x19));
+        break;
+    }
 }
 
 void oledPrintInfoLine()
