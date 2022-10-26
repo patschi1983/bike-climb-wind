@@ -37,10 +37,10 @@ void configClear(bool all);
 int settingsWheelBaseMM = 1000;
 char settingRiderId[4] = "PAT";
 int settingRiderWeight = 78;
-String settingBleHeartRateName = "TICKR 53C9";
-String settingBleHeartRateAddr = "dd:fb:8d:93:c7:29";
-String settingBleFitnessMachineName = "KICKR CORE 33BD";
-String settingBleFitnessMachineAddr = "ed:e8:05:37:e1:f2";
+String settingBleHeartRateName = "";
+String settingBleHeartRateAddr = "";
+String settingBleFitnessMachineName = "";
+String settingBleFitnessMachineAddr = "";
 
 bool settingsAreBleDevicesSet();
 bool settingsIsBleHeartRateDevSet();
@@ -73,7 +73,7 @@ void debugPrintln(String debugText);
 
 //***** ESP *****//
 char espFwName[16] = "BikeClimbWind"; // Name of the firmware
-char espFwVersion[8] = "0.4";         // Version of the firmware
+char espFwVersion[8] = "0.5";         // Version of the firmware
 byte espMac[6];                       // Byte array to store our MAC address
 
 char espNodeName[32] = "bcw";     // Nodes name - default value, may be overridden
@@ -103,6 +103,8 @@ void webSendHttpContent(String content, String find, String replace);
 void webSendHttpContent(String content);
 void webEndHttpMsg();
 void webHandleRoot();
+void webHandleBle();
+void webHandleSaveBle();
 void webHandleSettings();
 void webHandleSaveSettings();
 void webHandleStatus();
@@ -208,8 +210,22 @@ void oledPrintInclineLine();
 void oledPrintInfoLine();
 
 //***** HTML Text - Root *****//
-const char HTML_ROOT_SETTINGS[] PROGMEM = "<a href='/settings'><button>Settings</button></a>";
+const char HTML_ROOT_BLE[] PROGMEM = "<a href='/ble'><button>BLE Devices</button></a>";
+const char HTML_ROOT_SETTINGS[] PROGMEM = "<hr><a href='/settings'><button>Settings</button></a>";
 const char HTML_ROOT_STATUS[] PROGMEM = "<hr><a href='/status'><button>Status</button></a>";
+
+//***** HTML Text - BLE Devices *****//
+const char HTML_BLE_FORM_START[] PROGMEM = "<form method='POST' action='saveBle'>";
+const char HTML_BLE_HEARTRATE_1[] PROGMEM = "<b>Heartrate Sensor</b> <i><small>(required)</small></i>";
+const char HTML_BLE_HEARTRATE_2[] PROGMEM = "<br/><select id='heartRate' required name='heartRate'>";
+const char HTML_BLE_HEARTRATE_3_LOOP[] PROGMEM = "<option value='{heartRate}'>{heartRate}</option>";
+const char HTML_BLE_HEARTRATE_4[] PROGMEM = "</select>";
+const char HTML_BLE_FITNESS_MACHINE_1[] PROGMEM = "<b>Fitness Machine</b> <i><small>(required)</small></i>";
+const char HTML_BLE_FITNESS_MACHINE_2[] PROGMEM = "<br/><select id='fitnessMachine' required name='fitnessMachine'>";
+const char HTML_BLE_FITNESS_MACHINE_3_LOOP[] PROGMEM = "<option value='{fitnessMachine}'>{fitnessMachine}</option>";
+const char HTML_BLE_FITNESS_MACHINE_4[] PROGMEM = "</select>";
+const char HTML_BLE_BTN_SAVE_FORM_END[] PROGMEM = "<br/><br/><button type='submit'>Save</button></form>";
+const char HTML_BLE_BTN_BACK[] PROGMEM = "<hr><a href='/'><button>Back</button></a>";
 
 //***** HTML Text - Setting *****//
 const char HTML_SETTINGS_FORM_START[] PROGMEM = "<form method='POST' action='saveSettings'>";
@@ -279,9 +295,10 @@ void loop()
 
     webLoop();
 
-    bleLoop();
-
-    liftControl();
+    if (bleLoop())
+    {
+        liftControl();
+    }
 }
 
 //*****************************************************************************************************************//
@@ -359,6 +376,24 @@ void configRead()
                         liftLevelPos = configJson["liftLevelPos"];
                     }
 
+                    // Read ble settings
+                    if (!configJson["settingBleHeartRateName"].isNull())
+                    {
+                        settingBleHeartRateName = configJson["settingBleHeartRateName"].as<String>();
+                    }
+                    if (!configJson["settingBleHeartRateAddr"].isNull())
+                    {
+                        settingBleHeartRateAddr = configJson["settingBleHeartRateAddr"].as<String>();
+                    }
+                    if (!configJson["settingBleFitnessMachineName"].isNull())
+                    {
+                        settingBleFitnessMachineName = configJson["settingBleFitnessMachineName"].as<String>();;
+                    }
+                    if (!configJson["settingBleFitnessMachineAddr"].isNull())
+                    {
+                        settingBleFitnessMachineAddr = configJson["settingBleFitnessMachineAddr"].as<String>();;
+                    }
+
                     // Print read JSON configuration
                     String configJsonStr;
                     serializeJson(configJson, configJsonStr);
@@ -399,6 +434,12 @@ void configSave()
     jsonConfigValues["liftUpEndStop"] = liftUpEndStop;
     jsonConfigValues["liftDownEndStop"] = liftDownEndStop;
     jsonConfigValues["liftLevelPos"] = liftLevelPos;
+
+    // Save ble settings configuration
+    jsonConfigValues["settingBleHeartRateName"] = settingBleHeartRateName;
+    jsonConfigValues["settingBleHeartRateAddr"] = settingBleHeartRateAddr;
+    jsonConfigValues["settingBleFitnessMachineName"] = settingBleFitnessMachineName;
+    jsonConfigValues["settingBleFitnessMachineAddr"] = settingBleFitnessMachineAddr;
 
     File configFile = SPIFFS.open("/config.json", "w");
     if (!configFile)
@@ -564,6 +605,8 @@ void webSetup()
 
     // Setup webserver
     webServer.on("/", webHandleRoot);
+    webServer.on("/ble", webHandleBle);
+    webServer.on("/saveBle", webHandleSaveBle);
     webServer.on("/settings", webHandleSettings);
     webServer.on("/saveSettings", webHandleSaveSettings);
     webServer.on("/status", webHandleStatus);
@@ -661,13 +704,100 @@ void webHandleRoot()
 
     webStartHttpMsg(String(F("Navigation")), 200);
 
+    webSendHttpContent(HTML_ROOT_BLE);
     webSendHttpContent(HTML_ROOT_SETTINGS);
-
     webSendHttpContent(HTML_ROOT_STATUS);
 
     webEndHttpMsg();
 
     debugPrintln(String(F("HTTP: WebHandleRoot page sent.")));
+}
+
+void webHandleBle()
+{
+    debugPrintln(String(F("HTTP: WebHandleSettings called from client: ")) + webServer.client().remoteIP().toString());
+
+    webStartHttpMsg(String(F("BLE Devices")), 200);
+
+    String httpMessage = "";
+    webSendHttpContent(HTML_BLE_FORM_START);
+
+    // build section for heart rate
+    webSendHttpContent(HTML_BLE_HEARTRATE_1);
+    webSendHttpContent(HTML_BLE_HEARTRATE_2);
+
+    debugPrintln(String(F("HTTP: Build up heartrate sensor dropdown... ")));
+    for (int i = 0; i < bleScan->getResults().getCount(); i++)
+    {
+        BLEAdvertisedDevice device = bleScan->getResults().getDevice(i);
+        debugPrintln(String(F("HTTP: Found device - ")) + device.toString().c_str());
+
+        if (device.isAdvertisingService(bleServiceHeartRate))
+        {
+            String bleDevice = device.getName().c_str() + String(F(" | ")) + device.getAddress().toString().c_str();
+
+            webSendHttpContent(HTML_BLE_HEARTRATE_3_LOOP, String(F("{heartRate}")), bleDevice);
+        }
+    }
+    debugPrintln(String(F("HTTP: Built up heartrate sensor dropdown.")));
+    webSendHttpContent(HTML_BLE_HEARTRATE_4);
+
+    // build section for fitness machine
+    webSendHttpContent(HTML_BLE_FITNESS_MACHINE_1);
+    webSendHttpContent(HTML_BLE_FITNESS_MACHINE_2);
+
+    debugPrintln(String(F("HTTP: Build up fitness machine dropdown... ")));
+    for (int i = 0; i < bleScan->getResults().getCount(); i++)
+    {
+        BLEAdvertisedDevice device = bleScan->getResults().getDevice(i);
+        debugPrintln(String(F("HTTP: Found device - ")) + device.toString().c_str());
+
+        if (device.isAdvertisingService(bleServiceFitnessMachine))
+        {
+            String bleDevice = device.getName().c_str() + String(F(" | ")) + device.getAddress().toString().c_str();
+
+            webSendHttpContent(HTML_BLE_FITNESS_MACHINE_3_LOOP, String(F("{fitnessMachine}")), bleDevice);
+        }
+    }
+    debugPrintln(String(F("HTTP: Built up fitness machine dropdown.")));
+    webSendHttpContent(HTML_BLE_FITNESS_MACHINE_4);
+
+    webSendHttpContent(HTML_BLE_BTN_SAVE_FORM_END);
+    webSendHttpContent(HTML_BLE_BTN_BACK);
+
+    webEndHttpMsg();
+
+    debugPrintln(String(F("HTTP: WebHandleSettings page sent.")));
+}
+
+void webHandleSaveBle()
+{
+    debugPrintln(String(F("HTTP: WebHandleSaveBle called from client: ")) + webServer.client().remoteIP().toString());
+    int splitIndex = 0;
+
+    // save settings for heart rate sensor
+    String heartRateSensor = webServer.arg(String(F("heartRate")));
+    splitIndex = heartRateSensor.indexOf(String(F(" | ")));
+    settingBleHeartRateName = heartRateSensor.substring(0, splitIndex);
+    settingBleHeartRateAddr = heartRateSensor.substring(splitIndex + 3);
+
+    // save settings for fitness machine
+    String fitnessMachine = webServer.arg(String(F("fitnessMachine")));
+    splitIndex = fitnessMachine.indexOf(String(F(" | ")));
+    settingBleFitnessMachineName = fitnessMachine.substring(0, splitIndex);
+    settingBleFitnessMachineAddr = fitnessMachine.substring(splitIndex + 3);
+
+    // Config updated, notify user and trigger write of configurations or wifi settings7
+    debugPrintln(String(F("HTTP: Sending /saveBle page to client connected from: ")) + webServer.client().remoteIP().toString());
+
+    webStartHttpMsg(String(F("")), HTML_SAVESETTINGS_START_REDIR_15SEC, 200, String(F("/")));
+    webSendHttpContent(HTML_SAVESETTINGS_SAVE_RESTART, HTML_REPLACE_REDIRURL, String(F("/")));
+    webEndHttpMsg();
+
+    configSave();
+    espNodeReset();
+
+    debugPrintln(String(F("HTTP: WebHandleSaveBle page sent.")));
 }
 
 void webHandleSettings()
@@ -892,12 +1022,13 @@ void bleSetup()
 
 bool bleLoop()
 {
-    oledRefreshDisplay();
     bleConnectHeartRate();
     bleConnectFitnessMachine();
 
     if (!bleIsHeartRateConnected() || !bleIsFitnessMachineConnected())
     {
+        oledRefreshDisplay();
+
         // scan for devices
         debugPrintln(String(F("Starting BLE Scan for ")) + String(bleScanTime) + String(F("seconds ...")));
 
@@ -1228,6 +1359,8 @@ void liftControl()
 
         debugPrintln(String(F("Lift stopped - T#")) + String(liftTargetDistance) + String(F("|C#")) + String(liftDistance));
     }
+
+    oledRefreshDisplay();
 }
 
 bool liftIsMoving()
@@ -1359,8 +1492,8 @@ void liftSetupEndstopsAndLevelPos()
             sleep(10);
         }
 
-        configSave();                   // save endstops and level setting
-        liftMode = LIFT_MODE_LEVEL;     // leveling as next step
+        configSave();               // save endstops and level setting
+        liftMode = LIFT_MODE_LEVEL; // leveling as next step
     }
 }
 
@@ -1378,7 +1511,7 @@ void liftLevel()
             liftControl();
         }
 
-        liftLastTargetDistance = liftTargetDistance;    // save last target distance even if no movement has taken place
+        liftLastTargetDistance = liftTargetDistance; // save last target distance even if no movement has taken place
         debugPrintln(String(F("Leveling of lift done.")));
 
         liftMode = LIFT_MODE_AUTO; // leveling has been done lift is off
